@@ -1,0 +1,38 @@
+# ABOUTME: Cargo manifest for Fastly Blossom server
+# ABOUTME: Defines dependencies for Nostr auth, S3 signing, and Fastly Compute
+
+[package]
+name = "fastly-blossom"
+version = "0.1.0"
+edition = "2021"
+authors = ["Divine <hello@divine.video>"]
+description = "Blossom media server for Nostr running on Fastly Compute"
+
+[dependencies]
+# Fastly Compute SDK
+fastly = "0.11"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Cryptography - SHA-256 hashing
+sha2 = "0.10"
+
+# Cryptography - Nostr signature verification (pure Rust, WASM-compatible)
+# Pin to 0.13.3 to avoid base64ct 1.8+ which requires edition2024
+k256 = { version = "=0.13.3", features = ["schnorr"] }
+# Pin base64ct to avoid edition2024 requirement
+base64ct = "=1.6.0"
+
+# Cryptography - AWS v4 signing for B2
+hmac = "0.12"
+
+# Encoding
+hex = "0.4"
+base64 = "0.22"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true

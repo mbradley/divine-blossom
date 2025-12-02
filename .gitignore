@@ -1,0 +1,29 @@
+# ABOUTME: Git ignore patterns for Fastly Compute Rust project
+# ABOUTME: Excludes build artifacts, local config, and IDE files
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Fastly artifacts
+/bin/
+*.wasm
+*.tar.gz
+
+# Local development
+kv-store-data.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Private journal (local only)
+.private-journal/

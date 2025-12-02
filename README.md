@@ -1,0 +1,109 @@
+# Fastly Blossom Server
+
+A [Blossom](https://github.com/hzrd149/blossom) media server for Nostr running on Fastly Compute, optimized for video content.
+
+## Architecture
+
+```
+Fastly Compute (Rust) → Backblaze B2 (blobs) + Fastly KV (metadata)
+                     → GCP (async moderation)
+```
+
+## Features
+
+- **BUD-01**: Blob retrieval (GET/HEAD)
+- **BUD-02**: Upload/delete/list management
+- **BUD-03**: User server list support
+- **Nostr auth**: Kind 24242 signature validation
+- **Shadow restriction**: Moderated content only visible to owner
+- **Range requests**: Native video seeking support
+- **Free egress**: B2 → Fastly bandwidth is free
+
+## Setup
+
+### Prerequisites
+
+- [Fastly CLI](https://developer.fastly.com/learning/tools/cli/)
+- [Rust](https://rustup.rs/) with wasm32-wasi target
+- Backblaze B2 account
+- Fastly account with Compute enabled
+
+### Install Rust target
+
+```bash
+rustup target add wasm32-wasi
+```
+
+### Configure secrets
+
+1. Create a Backblaze B2 bucket
+2. Create an application key with read/write access
+3. Set up Fastly stores:
+
+```bash
+# Create KV store
+fastly kv-store create --name blossom_metadata
+
+# Create config store
+fastly config-store create --name blossom_config
+fastly config-store-entry create --store-id <id> --key b2_bucket --value your-bucket-name
+fastly config-store-entry create --store-id <id> --key b2_region --value us-west-004
+
+# Create secret store
+fastly secret-store create --name blossom_secrets
+fastly secret-store-entry create --store-id <id> --key b2_key_id --value your-key-id
+fastly secret-store-entry create --store-id <id> --key b2_app_key --value your-app-key
+```
+
+### Local development
+
+```bash
+# Edit fastly.toml with your B2 credentials for local testing
+fastly compute serve
+```
+
+### Deploy
+
+```bash
+fastly compute publish
+```
+
+## API Endpoints
+
+### BUD-01: Retrieval
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/<sha256>[.ext]` | Retrieve blob |
+| `HEAD` | `/<sha256>[.ext]` | Check blob exists |
+
+### BUD-02: Management
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `PUT` | `/upload` | Required | Upload blob |
+| `HEAD` | `/upload` | None | Get upload requirements |
+| `DELETE` | `/<sha256>` | Required | Delete blob |
+| `GET` | `/list/<pubkey>` | Optional | List user's blobs |
+
+## Authentication
+
+Uses Nostr kind 24242 events:
+
+```json
+{
+  "kind": 24242,
+  "content": "Upload blob",
+  "tags": [
+    ["t", "upload"],
+    ["x", "<sha256>"],
+    ["expiration", "<unix_timestamp>"]
+  ]
+}
+```
+
+Send as: `Authorization: Nostr <base64_encoded_signed_event>`
+
+## License
+
+MIT
