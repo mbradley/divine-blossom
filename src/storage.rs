@@ -1,5 +1,5 @@
-// ABOUTME: Backblaze B2 storage operations via S3-compatible API
-// ABOUTME: Implements AWS v4 signing and blob upload/download/delete
+// ABOUTME: Google Cloud Storage operations via S3-compatible API
+// ABOUTME: Implements AWS v4 signing with GCS HMAC authentication
 
 use crate::error::{BlossomError, Result};
 use fastly::http::{Method, StatusCode};
@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
-const B2_BACKEND: &str = "b2_s3";
+const GCS_BACKEND: &str = "gcs_storage";
 
 /// Config store name
 const CONFIG_STORE: &str = "blossom_config";
@@ -17,11 +17,20 @@ const CONFIG_STORE: &str = "blossom_config";
 /// Secret store name
 const SECRET_STORE: &str = "blossom_secrets";
 
-/// AWS signature version
+/// AWS signature version (works with GCS HMAC)
 const AWS_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
-/// S3 service name
+/// S3 service name (GCS uses s3 for S3-compat mode)
 const SERVICE: &str = "s3";
+
+/// GCS region for signing (use "auto" for path-style)
+const GCS_REGION: &str = "auto";
+
+/// Multipart upload threshold (5MB)
+const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024;
+
+/// Part size for multipart uploads (5MB)
+const PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Get config value
 fn get_config(key: &str) -> Result<String> {
@@ -46,36 +55,38 @@ fn get_secret(key: &str) -> Result<String> {
         .map_err(|e| BlossomError::Internal(format!("Secret is not valid UTF-8: {}", e)))
 }
 
-/// B2 configuration
-struct B2Config {
-    key_id: String,
-    app_key: String,
+/// GCS configuration
+struct GCSConfig {
+    access_key: String,    // HMAC access key
+    secret_key: String,    // HMAC secret key
     bucket: String,
-    region: String,
 }
 
-impl B2Config {
+impl GCSConfig {
     fn load() -> Result<Self> {
-        Ok(B2Config {
-            key_id: get_secret("b2_key_id")?,
-            app_key: get_secret("b2_app_key")?,
-            bucket: get_config("b2_bucket")?,
-            region: get_config("b2_region")?,
+        Ok(GCSConfig {
+            access_key: get_secret("gcs_access_key")?,
+            secret_key: get_secret("gcs_secret_key")?,
+            bucket: get_config("gcs_bucket")?,
         })
     }
 
     fn host(&self) -> String {
-        format!("s3.{}.backblazeb2.com", self.region)
+        "storage.googleapis.com".to_string()
     }
 
     fn endpoint(&self) -> String {
         format!("https://{}", self.host())
     }
+
+    fn region(&self) -> &str {
+        GCS_REGION
+    }
 }
 
-/// Upload a blob to B2
+/// Upload a blob to GCS
 pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Result<()> {
-    let config = B2Config::load()?;
+    let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
@@ -89,7 +100,7 @@ pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Res
     req.set_body(body);
 
     let resp = req
-        .send(B2_BACKEND)
+        .send(GCS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("Failed to upload: {}", e)))?;
 
     if !resp.get_status().is_success() {
@@ -102,9 +113,9 @@ pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Res
     Ok(())
 }
 
-/// Download a blob from B2 (returns the response to stream back)
+/// Download a blob from GCS (returns the response to stream back)
 pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
-    let config = B2Config::load()?;
+    let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::GET, format!("{}{}", config.endpoint(), path));
@@ -118,7 +129,7 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
 
     let resp = req
-        .send(B2_BACKEND)
+        .send(GCS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("Failed to download: {}", e)))?;
 
     match resp.get_status() {
@@ -131,9 +142,9 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
     }
 }
 
-/// Check if a blob exists in B2
+/// Check if a blob exists in GCS
 pub fn blob_exists(hash: &str) -> Result<bool> {
-    let config = B2Config::load()?;
+    let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::HEAD, format!("{}{}", config.endpoint(), path));
@@ -142,15 +153,15 @@ pub fn blob_exists(hash: &str) -> Result<bool> {
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
 
     let resp = req
-        .send(B2_BACKEND)
+        .send(GCS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("Failed to check blob: {}", e)))?;
 
     Ok(resp.get_status() == StatusCode::OK)
 }
 
-/// Delete a blob from B2
+/// Delete a blob from GCS
 pub fn delete_blob(hash: &str) -> Result<()> {
-    let config = B2Config::load()?;
+    let config = GCSConfig::load()?;
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::DELETE, format!("{}{}", config.endpoint(), path));
@@ -159,7 +170,7 @@ pub fn delete_blob(hash: &str) -> Result<()> {
     sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
 
     let resp = req
-        .send(B2_BACKEND)
+        .send(GCS_BACKEND)
         .map_err(|e| BlossomError::StorageError(format!("Failed to delete: {}", e)))?;
 
     if !resp.get_status().is_success() && resp.get_status() != StatusCode::NOT_FOUND {
@@ -237,8 +248,8 @@ fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-/// AWS v4 request signing
-fn sign_request(req: &mut Request, config: &B2Config, payload_hash: Option<String>) -> Result<()> {
+/// AWS v4 request signing (works with GCS HMAC)
+fn sign_request(req: &mut Request, config: &GCSConfig, payload_hash: Option<String>) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -284,7 +295,7 @@ fn sign_request(req: &mut Request, config: &B2Config, payload_hash: Option<Strin
     );
 
     // Create string to sign
-    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region, SERVICE);
+    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region(), SERVICE);
 
     let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
 
@@ -294,13 +305,13 @@ fn sign_request(req: &mut Request, config: &B2Config, payload_hash: Option<Strin
     );
 
     // Calculate signature
-    let signing_key = get_signing_key(&config.app_key, &date_stamp, &config.region)?;
+    let signing_key = get_signing_key(&config.secret_key, &date_stamp, config.region())?;
     let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
 
     // Create authorization header
     let authorization = format!(
         "{} Credential={}/{}, SignedHeaders={}, Signature={}",
-        AWS_ALGORITHM, config.key_id, credential_scope, signed_headers, signature
+        AWS_ALGORITHM, config.access_key, credential_scope, signed_headers, signature
     );
 
     req.set_header("Authorization", authorization);
