@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Backend name (must match fastly.toml)
-const B2_BACKEND: &str = "b2_storage";
+const B2_BACKEND: &str = "b2_s3";
 
 /// Config store name
 const CONFIG_STORE: &str = "blossom_config";

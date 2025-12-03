@@ -28,3 +28,18 @@ Thumbs.db
 
 # Private journal (local only)
 .private-journal/
+
+# Secrets and config (contain API keys)
+secrets.json
+config.json
+
+# Test files
+test*.mjs
+test*.sh
+create-bucket.sh
+*.mp4
+*.ppm
+*.png
+node_modules/
+package.json
+package-lock.json

@@ -41,6 +41,10 @@ fn handle_request(req: Request) -> Result<Response> {
     let path = req.get_path().to_string();
 
     match (method, path.as_str()) {
+        // Version check
+        (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
+            .with_body("v57-fixbackend-20251203")),
+
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
         (Method::HEAD, p) if is_hash_path(p) => handle_head_blob(p),

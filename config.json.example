@@ -1,0 +1,4 @@
+{
+  "b2_bucket": "YOUR_BUCKET_NAME",
+  "b2_region": "us-west-004"
+}
