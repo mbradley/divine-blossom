@@ -342,6 +342,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 /// Placeholder for body hash during signing
 /// For streaming uploads, we use UNSIGNED-PAYLOAD
 fn hash_body_for_signing(_size: u64) -> String {
-    // For large uploads, use unsigned payload and let B2 verify
+    // For large uploads, use unsigned payload and let GCS verify
     "UNSIGNED-PAYLOAD".into()
 }
