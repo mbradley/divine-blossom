@@ -1,0 +1,5 @@
+functions-framework==3.*
+google-cloud-storage==2.*
+google-cloud-vision==3.*
+google-cloud-videointelligence==2.*
+requests==2.*
