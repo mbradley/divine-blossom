@@ -84,9 +84,15 @@ impl GCSConfig {
     }
 }
 
-/// Upload a blob to GCS
+/// Upload a blob to GCS (simple PUT for small files)
 pub fn upload_blob(hash: &str, body: Body, content_type: &str, size: u64) -> Result<()> {
     let config = GCSConfig::load()?;
+
+    // For large files, use multipart upload
+    if size > MULTIPART_THRESHOLD {
+        return upload_blob_multipart(hash, body, content_type, size);
+    }
+
     let path = format!("/{}/{}", config.bucket, hash);
 
     let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
@@ -179,6 +185,176 @@ pub fn delete_blob(hash: &str) -> Result<()> {
             resp.get_status()
         )));
     }
+
+    Ok(())
+}
+
+/// Initiate a multipart upload to GCS
+fn initiate_multipart_upload(hash: &str, content_type: &str) -> Result<String> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}?uploads", config.bucket, hash);
+
+    let mut req = Request::new(Method::POST, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+    req.set_header("Content-Type", content_type);
+    req.set_header("Content-Length", "0");
+
+    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    let mut resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to initiate multipart: {}", e)))?;
+
+    if !resp.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "Initiate multipart failed with status: {}",
+            resp.get_status()
+        )));
+    }
+
+    // Parse XML response to get UploadId
+    let body = resp.take_body().into_string();
+
+    // Simple XML parsing for UploadId
+    let upload_id = extract_upload_id(&body)
+        .ok_or_else(|| BlossomError::StorageError("Failed to parse UploadId from response".into()))?;
+
+    Ok(upload_id)
+}
+
+/// Extract UploadId from XML response
+fn extract_upload_id(xml: &str) -> Option<String> {
+    // Look for <UploadId>...</UploadId>
+    let start_tag = "<UploadId>";
+    let end_tag = "</UploadId>";
+
+    let start = xml.find(start_tag)? + start_tag.len();
+    let end = xml[start..].find(end_tag)? + start;
+
+    Some(xml[start..end].to_string())
+}
+
+/// Upload a single part of a multipart upload
+fn upload_part(
+    hash: &str,
+    upload_id: &str,
+    part_number: u32,
+    body: &[u8],
+) -> Result<String> {
+    let config = GCSConfig::load()?;
+    let path = format!(
+        "/{}/{}?partNumber={}&uploadId={}",
+        config.bucket, hash, part_number, upload_id
+    );
+
+    let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+    req.set_header("Content-Length", body.len().to_string());
+
+    // Calculate content hash for this part
+    let content_hash = hex::encode(Sha256::digest(body));
+    sign_request(&mut req, &config, Some(content_hash))?;
+
+    req.set_body(Body::from(body.to_vec()));
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to upload part: {}", e)))?;
+
+    if !resp.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "Upload part {} failed with status: {}",
+            part_number,
+            resp.get_status()
+        )));
+    }
+
+    // Get ETag from response header
+    let etag = resp
+        .get_header("ETag")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim_matches('"').to_string())
+        .ok_or_else(|| BlossomError::StorageError("Missing ETag in part response".into()))?;
+
+    Ok(etag)
+}
+
+/// Complete a multipart upload
+fn complete_multipart_upload(
+    hash: &str,
+    upload_id: &str,
+    parts: &[(u32, String)], // (part_number, etag)
+) -> Result<()> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}?uploadId={}", config.bucket, hash, upload_id);
+
+    // Build XML body
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (part_number, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+            part_number, etag
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+
+    let content_hash = hex::encode(Sha256::digest(xml.as_bytes()));
+
+    let mut req = Request::new(Method::POST, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+    req.set_header("Content-Type", "application/xml");
+    req.set_header("Content-Length", xml.len().to_string());
+
+    sign_request(&mut req, &config, Some(content_hash))?;
+
+    req.set_body(xml);
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to complete multipart: {}", e)))?;
+
+    if !resp.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "Complete multipart failed with status: {}",
+            resp.get_status()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Upload a large blob using multipart upload
+fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64) -> Result<()> {
+    // Read entire body into memory (required for chunking)
+    let body_bytes = body.into_bytes();
+
+    if body_bytes.len() as u64 != size {
+        return Err(BlossomError::BadRequest(
+            "Content-Length doesn't match body size".into(),
+        ));
+    }
+
+    // Initiate multipart upload
+    let upload_id = initiate_multipart_upload(hash, content_type)?;
+
+    // Upload parts
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    let mut offset: usize = 0;
+    let mut part_number: u32 = 1;
+
+    while offset < body_bytes.len() {
+        let end = std::cmp::min(offset + PART_SIZE as usize, body_bytes.len());
+        let chunk = &body_bytes[offset..end];
+
+        let etag = upload_part(hash, &upload_id, part_number, chunk)?;
+        parts.push((part_number, etag));
+
+        offset = end;
+        part_number += 1;
+    }
+
+    // Complete multipart upload
+    complete_multipart_upload(hash, &upload_id, &parts)?;
 
     Ok(())
 }
