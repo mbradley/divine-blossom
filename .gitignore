@@ -3,6 +3,7 @@
 
 # Rust build artifacts
 /target/
+**/target/
 **/*.rs.bk
 Cargo.lock
 
@@ -43,3 +44,4 @@ create-bucket.sh
 node_modules/
 package.json
 package-lock.json
+.env

@@ -190,9 +190,10 @@ pub fn delete_blob(hash: &str) -> Result<()> {
 }
 
 /// Initiate a multipart upload to GCS
-fn initiate_multipart_upload(hash: &str, content_type: &str) -> Result<String> {
+fn initiate_multipart_upload(key: &str, content_type: &str) -> Result<String> {
     let config = GCSConfig::load()?;
-    let path = format!("/{}/{}?uploads", config.bucket, hash);
+    // Note: query string must be "uploads=" not just "uploads" for correct AWS4 signing
+    let path = format!("/{}/{}?uploads=", config.bucket, key);
 
     let mut req = Request::new(Method::POST, format!("{}{}", config.endpoint(), path));
     req.set_header("Host", config.host());
@@ -206,9 +207,10 @@ fn initiate_multipart_upload(hash: &str, content_type: &str) -> Result<String> {
         .map_err(|e| BlossomError::StorageError(format!("Failed to initiate multipart: {}", e)))?;
 
     if !resp.get_status().is_success() {
+        let body = resp.take_body().into_string();
         return Err(BlossomError::StorageError(format!(
-            "Initiate multipart failed with status: {}",
-            resp.get_status()
+            "Initiate multipart failed with status: {}, body: {}",
+            resp.get_status(), body
         )));
     }
 
@@ -323,7 +325,7 @@ fn complete_multipart_upload(
     Ok(())
 }
 
-/// Upload a large blob using multipart upload
+/// Upload a large blob using multipart upload (legacy - buffers entire body)
 fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64) -> Result<()> {
     // Read entire body into memory (required for chunking)
     let body_bytes = body.into_bytes();
@@ -355,6 +357,296 @@ fn upload_blob_multipart(hash: &str, body: Body, content_type: &str, size: u64) 
 
     // Complete multipart upload
     complete_multipart_upload(hash, &upload_id, &parts)?;
+
+    Ok(())
+}
+
+/// Streaming chunk size for reading body (256KB - safe for WASM memory)
+const STREAMING_CHUNK_SIZE: usize = 256 * 1024;
+
+/// Upload a blob using true streaming to avoid memory issues
+/// Returns the computed SHA-256 hash of the uploaded content
+///
+/// Strategy (works for any file size up to 5GB):
+/// 1. Stream body directly to GCS temp location (no buffering in WASM!)
+/// 2. Download from temp to compute SHA-256 hash in streaming fashion
+/// 3. Copy from temp to final hash-based location
+/// 4. Delete temporary object
+///
+/// This approach never buffers more than STREAMING_CHUNK_SIZE (256KB) in memory,
+/// which is critical for Fastly Compute's limited WASM heap.
+pub fn upload_blob_streaming(body: Body, content_type: &str, expected_size: u64) -> Result<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let config = GCSConfig::load()?;
+
+    // Generate temporary object name with random suffix to avoid collisions
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let temp_key = format!("_temp/{}", timestamp);
+
+    // Use simple streaming PUT for all file sizes (up to GCS 5GB single-object limit)
+    upload_blob_streaming_simple(body, content_type, expected_size, &temp_key, &config)
+}
+
+/// True streaming upload: Upload body to temp, then download to compute hash, then copy to final
+/// This approach never buffers the entire file in memory
+fn upload_blob_streaming_simple(body: Body, content_type: &str, expected_size: u64, temp_key: &str, config: &GCSConfig) -> Result<String> {
+    // Step 1: Stream body directly to temp location (no buffering!)
+    let path = format!("/{}/{}", config.bucket, temp_key);
+    let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
+    req.set_header("Content-Type", content_type);
+    req.set_header("Content-Length", expected_size.to_string());
+    req.set_header("Host", config.host());
+
+    sign_request(&mut req, config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    // Pass the body through directly - Fastly's runtime handles streaming
+    req.set_body(body);
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to upload to temp: {}", e)))?;
+
+    let status = resp.get_status();
+    if !status.is_success() {
+        let body = resp.into_body_str();
+        return Err(BlossomError::StorageError(format!(
+            "Temp upload failed with status: {}, body: {}",
+            status, body
+        )));
+    }
+
+    // Step 2: Download from temp and compute hash in streaming fashion
+    let hash = compute_hash_from_gcs(temp_key)?;
+
+    // Check if blob already exists at final location
+    if blob_exists(&hash)? {
+        let _ = delete_blob(temp_key);
+        return Ok(hash);
+    }
+
+    // Step 3: Copy from temp to final hash location
+    copy_blob(temp_key, &hash)?;
+
+    // Step 4: Delete temp
+    let _ = delete_blob(temp_key);
+
+    Ok(hash)
+}
+
+/// Download a blob from GCS and compute its SHA-256 hash in streaming fashion
+fn compute_hash_from_gcs(key: &str) -> Result<String> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}", config.bucket, key);
+
+    let mut req = Request::new(Method::GET, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+
+    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to download for hashing: {}", e)))?;
+
+    if !resp.get_status().is_success() {
+        return Err(BlossomError::StorageError(format!(
+            "Download for hash failed with status: {}",
+            resp.get_status()
+        )));
+    }
+
+    // Stream through the body and compute hash
+    let mut hasher = Sha256::new();
+    let mut body = resp.into_body();
+
+    for chunk_result in body.read_chunks(STREAMING_CHUNK_SIZE) {
+        let chunk = chunk_result.map_err(|e| {
+            BlossomError::Internal(format!("Failed to read chunk for hashing: {}", e))
+        })?;
+        hasher.update(&chunk);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Streaming upload for large files (> 5MB)
+/// For files > 5MB, we can't use simple PUT (GCS has 5GB limit per request but we
+/// can't stream without knowing the hash, and we can't buffer 5GB+).
+/// Instead, we use the simple streaming approach: upload to temp, download to hash, copy.
+/// This works for files up to any size supported by GCS PUT (5GB per object).
+fn upload_blob_streaming_multipart(body: Body, content_type: &str, expected_size: u64, temp_key: &str, config: &GCSConfig) -> Result<String> {
+    // For large files, still use the streaming approach:
+    // 1. Stream body directly to temp (Fastly handles the streaming)
+    // 2. Download from temp to compute hash
+    // 3. Copy to final location
+    //
+    // Note: GCS allows PUT up to 5GB per request, so this works for most files.
+    // For files > 5GB, we'd need true multipart upload, but that requires 5MB
+    // minimum parts which exceeds WASM memory limits on Fastly Compute.
+
+    let path = format!("/{}/{}", config.bucket, temp_key);
+    let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
+    req.set_header("Content-Type", content_type);
+    req.set_header("Content-Length", expected_size.to_string());
+    req.set_header("Host", config.host());
+
+    sign_request(&mut req, config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    // Pass the body through directly
+    req.set_body(body);
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to upload to temp: {}", e)))?;
+
+    let status = resp.get_status();
+    if !status.is_success() {
+        let body = resp.into_body_str();
+        return Err(BlossomError::StorageError(format!(
+            "Temp upload failed with status: {}, body: {}",
+            status, body
+        )));
+    }
+
+    // Download from temp and compute hash in streaming fashion
+    let hash = compute_hash_from_gcs(temp_key)?;
+
+    // Check if blob already exists at final location
+    if blob_exists(&hash)? {
+        let _ = delete_blob(temp_key);
+        return Ok(hash);
+    }
+
+    // Copy from temp to final hash location
+    copy_blob(temp_key, &hash)?;
+
+    // Delete temp
+    let _ = delete_blob(temp_key);
+
+    Ok(hash)
+}
+
+/// Copy a blob from source to destination within the same bucket
+fn copy_blob(source_key: &str, dest_key: &str) -> Result<()> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}", config.bucket, dest_key);
+
+    let mut req = Request::new(Method::PUT, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+    req.set_header("Content-Length", "0");
+
+    // x-amz-copy-source header specifies the source object
+    // URL encode the path separator in the key
+    let encoded_source = source_key.replace('/', "%2F");
+    let copy_source = format!("/{}/{}", config.bucket, encoded_source);
+    req.set_header("x-amz-copy-source", &copy_source);
+
+    // Sign with copy source header included
+    sign_copy_request(&mut req, &config, &copy_source)?;
+
+    let resp = req
+        .send(GCS_BACKEND)
+        .map_err(|e| BlossomError::StorageError(format!("Failed to copy blob: {}", e)))?;
+
+    if !resp.get_status().is_success() {
+        let body = resp.into_body_str();
+        return Err(BlossomError::StorageError(format!(
+            "Copy failed with status, body: {}",
+            body
+        )));
+    }
+
+    Ok(())
+}
+
+/// Sign a copy request (includes x-amz-copy-source in signed headers)
+fn sign_copy_request(req: &mut Request, config: &GCSConfig, copy_source: &str) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let secs = now.as_secs();
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let (year, month, day) = days_to_ymd(days_since_epoch);
+
+    let date_stamp = format!("{:04}{:02}{:02}", year, month, day);
+    let amz_date = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        year, month, day, hours, minutes, seconds
+    );
+
+    // Set required headers
+    req.set_header("x-amz-date", &amz_date);
+
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    req.set_header("x-amz-content-sha256", payload_hash);
+
+    // Create canonical request
+    let method = req.get_method_str();
+    let uri = req.get_path();
+    let query = req.get_query_str().unwrap_or("");
+
+    let host = config.host();
+
+    // Include x-amz-copy-source in signed headers (alphabetical order!)
+    let signed_headers = "host;x-amz-content-sha256;x-amz-copy-source;x-amz-date";
+
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-copy-source:{}\nx-amz-date:{}\n",
+        host, payload_hash, copy_source, amz_date
+    );
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, uri, query, canonical_headers, signed_headers, payload_hash
+    );
+
+    // Create string to sign
+    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, config.region(), SERVICE);
+
+    let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+
+    let string_to_sign = format!(
+        "{}\n{}\n{}\n{}",
+        AWS_ALGORITHM, amz_date, credential_scope, canonical_request_hash
+    );
+
+    // Calculate signature
+    let signing_key = get_signing_key(&config.secret_key, &date_stamp, config.region())?;
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
+
+    // Create authorization header
+    let authorization = format!(
+        "{} Credential={}/{}, SignedHeaders={}, Signature={}",
+        AWS_ALGORITHM, config.access_key, credential_scope, signed_headers, signature
+    );
+
+    req.set_header("Authorization", authorization);
+
+    Ok(())
+}
+
+/// Abort a multipart upload (cleanup on error)
+fn abort_multipart_upload(key: &str, upload_id: &str) -> Result<()> {
+    let config = GCSConfig::load()?;
+    let path = format!("/{}/{}?uploadId={}", config.bucket, key, upload_id);
+
+    let mut req = Request::new(Method::DELETE, format!("{}{}", config.endpoint(), path));
+    req.set_header("Host", config.host());
+
+    sign_request(&mut req, &config, Some("UNSIGNED-PAYLOAD".into()))?;
+
+    let _ = req.send(GCS_BACKEND);
+    // Ignore errors - this is best-effort cleanup
 
     Ok(())
 }

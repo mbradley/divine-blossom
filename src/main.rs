@@ -23,8 +23,8 @@ use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 
-/// Maximum upload size (100 MB)
-const MAX_UPLOAD_SIZE: u64 = 100 * 1024 * 1024;
+/// Maximum upload size (200 MB) - supports high-bitrate 6-second 4K video
+const MAX_UPLOAD_SIZE: u64 = 200 * 1024 * 1024;
 
 /// Entry point
 #[fastly::main]
@@ -46,7 +46,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v62-baseurl-fix")),
+            .with_body("v89-cloud-run-proxy")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -136,6 +136,12 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     Ok(resp)
 }
 
+/// Maximum size for in-process upload (500KB) - larger files proxy to Cloud Run
+const CLOUD_RUN_THRESHOLD: u64 = 500 * 1024;
+
+/// Cloud Run upload backend name (must match fastly.toml)
+const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
+
 /// PUT /upload - Upload blob
 fn handle_upload(mut req: Request) -> Result<Response> {
     // Validate auth
@@ -162,7 +168,14 @@ fn handle_upload(mut req: Request) -> Result<Response> {
         )));
     }
 
-    // Read body and compute hash
+    let base_url = get_base_url(&req);
+
+    // Proxy large uploads to Cloud Run to avoid WASM memory limits
+    if content_length > CLOUD_RUN_THRESHOLD {
+        return handle_cloud_run_proxy(req, auth, content_type, content_length, base_url);
+    }
+
+    // For small files, buffer in memory (safe for <= 500KB)
     let body_bytes = req.take_body().into_bytes();
     let actual_size = body_bytes.len() as u64;
 
@@ -181,12 +194,12 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     if blob_exists(&hash)? {
         // Return existing blob descriptor
         if let Some(metadata) = get_blob_metadata(&hash)? {
-            let descriptor = metadata.to_descriptor(&get_base_url(&req));
+            let descriptor = metadata.to_descriptor(&base_url);
             return Ok(json_response(StatusCode::OK, &descriptor));
         }
     }
 
-    // Upload to B2
+    // Upload to GCS
     upload_blob(
         &hash,
         fastly::Body::from(body_bytes),
@@ -212,7 +225,99 @@ fn handle_upload(mut req: Request) -> Result<Response> {
     add_to_user_list(&auth.pubkey, &hash)?;
 
     // Return blob descriptor
-    let descriptor = metadata.to_descriptor(&get_base_url(&req));
+    let descriptor = metadata.to_descriptor(&base_url);
+    let mut resp = json_response(StatusCode::OK, &descriptor);
+    add_cors_headers(&mut resp);
+
+    Ok(resp)
+}
+
+/// Handle large uploads by proxying to Cloud Run
+/// Fastly Compute has WASM memory limits (~5MB), so large files must be proxied
+fn handle_cloud_run_proxy(
+    mut req: Request,
+    auth: crate::blossom::BlossomAuthEvent,
+    content_type: String,
+    content_length: u64,
+    base_url: String,
+) -> Result<Response> {
+    // Get the original Authorization header to forward
+    let auth_header = req
+        .get_header(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| BlossomError::AuthRequired("Missing authorization header".into()))?;
+
+    // Get the body to forward
+    let body = req.take_body();
+
+    // Build request to Cloud Run
+    let mut proxy_req = Request::new(
+        fastly::http::Method::PUT,
+        "https://blossom-upload-rust-149672065768.us-central1.run.app/upload",
+    );
+    proxy_req.set_header("Host", "blossom-upload-rust-149672065768.us-central1.run.app");
+    proxy_req.set_header(header::AUTHORIZATION, &auth_header);
+    proxy_req.set_header(header::CONTENT_TYPE, &content_type);
+    proxy_req.set_header(header::CONTENT_LENGTH, content_length.to_string());
+    proxy_req.set_body(body);
+
+    // Send to Cloud Run
+    let mut proxy_resp = proxy_req
+        .send(CLOUD_RUN_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+
+    // Check for errors from Cloud Run
+    if !proxy_resp.get_status().is_success() {
+        let status = proxy_resp.get_status();
+        let body = proxy_resp.take_body().into_string();
+        return Err(BlossomError::Internal(format!(
+            "Cloud Run upload failed ({}): {}",
+            status, body
+        )));
+    }
+
+    // Parse Cloud Run response to get the hash
+    let resp_body = proxy_resp.take_body().into_string();
+    let cloud_run_resp: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
+
+    let hash = cloud_run_resp["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::Internal("Missing sha256 in Cloud Run response".into()))?
+        .to_string();
+
+    let size = cloud_run_resp["size"]
+        .as_u64()
+        .unwrap_or(content_length);
+
+    // Check if metadata already exists (dedupe case)
+    if let Some(metadata) = get_blob_metadata(&hash)? {
+        let descriptor = metadata.to_descriptor(&base_url);
+        let mut resp = json_response(StatusCode::OK, &descriptor);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    // Store metadata in Fastly's KV store
+    let metadata = BlobMetadata {
+        sha256: hash.clone(),
+        size,
+        mime_type: content_type,
+        uploaded: current_timestamp(),
+        owner: auth.pubkey.clone(),
+        status: BlobStatus::Pending,
+        thumbnail: None,
+        moderation: None,
+    };
+
+    put_blob_metadata(&metadata)?;
+
+    // Add to user's list
+    add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Return blob descriptor with Fastly's CDN URL
+    let descriptor = metadata.to_descriptor(&base_url);
     let mut resp = json_response(StatusCode::OK, &descriptor);
     add_cors_headers(&mut resp);
 
@@ -502,7 +607,7 @@ fn handle_landing_page() -> Response {
         <section>
             <h2>Protocol</h2>
             <p>This server implements the <a href="https://github.com/hzrd149/blossom">Blossom protocol</a> (BUD-01 and BUD-02) for decentralized media hosting on Nostr.</p>
-            <p style="margin-top: 0.5rem;">Maximum upload size: <code>100 MB</code></p>
+            <p style="margin-top: 0.5rem;">Maximum upload size: <code>200 MB</code></p>
         </section>
 
         <footer>
