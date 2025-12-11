@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::{header, Method, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{put, options},
+    routing::{put, post, options},
     Router,
 };
 use bytes::Bytes;
@@ -21,7 +21,7 @@ use google_cloud_storage::{
 };
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder;
-use k256::schnorr::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
+use k256::schnorr::{signature::hazmat::PrehashVerifier, signature::Signer, Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{env, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
@@ -34,6 +34,7 @@ struct Config {
     gcs_bucket: String,
     cdn_base_url: String,
     port: u16,
+    migration_nsec: Option<String>,
 }
 
 impl Config {
@@ -42,6 +43,7 @@ impl Config {
             gcs_bucket: env::var("GCS_BUCKET").unwrap_or_else(|_| "divine-blossom-media".to_string()),
             cdn_base_url: env::var("CDN_BASE_URL").unwrap_or_else(|_| "https://cdn.divine.video".to_string()),
             port: env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080),
+            migration_nsec: env::var("MIGRATION_NSEC").ok(),
         }
     }
 }
@@ -75,6 +77,24 @@ struct UploadResponse {
     url: String,
 }
 
+// Migration request
+#[derive(Deserialize)]
+struct MigrateRequest {
+    source_url: String,
+    expected_hash: Option<String>,
+}
+
+// Migration response
+#[derive(Serialize)]
+struct MigrateResponse {
+    sha256: String,
+    size: u64,
+    #[serde(rename = "type")]
+    content_type: String,
+    migrated: bool,
+    source_url: String,
+}
+
 // Error response
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -105,7 +125,7 @@ async fn main() -> Result<()> {
     // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::PUT, Method::OPTIONS])
+        .allow_methods([Method::PUT, Method::POST, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         .max_age(std::time::Duration::from_secs(86400));
 
@@ -113,6 +133,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/upload", put(handle_upload))
         .route("/upload", options(handle_cors_preflight))
+        .route("/migrate", post(handle_migrate))
+        .route("/migrate", options(handle_cors_preflight))
         .route("/", put(handle_upload))
         .route("/", options(handle_cors_preflight))
         .layer(cors)
@@ -399,4 +421,289 @@ fn get_extension(content_type: &str) -> &'static str {
         "application/pdf" => "pdf",
         _ => "bin",
     }
+}
+
+/// Handle migration requests - fetch from URL and upload to GCS
+/// POST /migrate { "source_url": "https://cdn.example.com/hash", "expected_hash": "abc123" }
+async fn handle_migrate(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<MigrateRequest>,
+) -> Response {
+    match process_migrate(state, request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => {
+            error!("Migration error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response()
+        }
+    }
+}
+
+async fn process_migrate(
+    state: Arc<AppState>,
+    request: MigrateRequest,
+) -> Result<MigrateResponse> {
+    info!("Migration request for: {}", request.source_url);
+
+    // Validate URL is from allowed Blossom/CDN sources
+    // Expanded to include popular Blossom servers for BUD-04 mirror support
+    let allowed_domains = [
+        // Divine infrastructure
+        "cdn.divine.video",
+        "blossom.divine.video",
+        "stream.bunny.net",
+        // Satellite.earth
+        "cdn.satellite.earth",
+        "satellite.earth",
+        // nostr.build - popular media host
+        "nostr.build",
+        "image.nostr.build",
+        "media.nostr.build",
+        "video.nostr.build",
+        // void.cat - another popular host
+        "void.cat",
+        // Primal
+        "primal.b-cdn.net",
+        "media.primal.net",
+        // Other Blossom servers
+        "blossom.oxtr.dev",
+        "blossom.primal.net",
+        "files.sovbit.host",
+        "blossom.f7z.io",
+        "nostrcheck.me",
+    ];
+    let url = url::Url::parse(&request.source_url)
+        .map_err(|e| anyhow!("Invalid URL: {}", e))?;
+
+    let host = url.host_str().ok_or_else(|| anyhow!("URL must have a host"))?;
+    if !allowed_domains.iter().any(|d| host.ends_with(d)) {
+        return Err(anyhow!("Source URL must be from an allowed domain"));
+    }
+
+    // Fetch content from source
+    let client = reqwest::Client::new();
+    let mut response = client.get(&request.source_url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to fetch source: {}", e))?;
+
+    // If we get 401, try with Nostr auth
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        info!("Source requires auth, attempting Nostr auth...");
+
+        if let Some(nsec) = &state.config.migration_nsec {
+            let auth_header = create_blossom_auth(nsec, "get", &request.source_url)?;
+            response = client.get(&request.source_url)
+                .header("Authorization", auth_header)
+                .send()
+                .await
+                .map_err(|e| anyhow!("Failed to fetch source with auth: {}", e))?;
+        } else {
+            return Err(anyhow!("Source requires auth but no MIGRATION_NSEC configured"));
+        }
+    }
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Source returned status: {}", response.status()));
+    }
+
+    // Get content type from response
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    // Stream and hash the content
+    let mut hasher = Sha256::new();
+    let mut all_bytes = Vec::new();
+    let mut total_size: u64 = 0;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| anyhow!("Stream error: {}", e))?;
+        hasher.update(&chunk);
+        total_size += chunk.len() as u64;
+        all_bytes.extend_from_slice(&chunk);
+    }
+
+    let sha256_hash = hex::encode(hasher.finalize());
+
+    // Verify hash if expected_hash is provided
+    if let Some(expected) = &request.expected_hash {
+        if &sha256_hash != expected {
+            return Err(anyhow!(
+                "Hash mismatch: expected {}, got {}",
+                expected,
+                sha256_hash
+            ));
+        }
+    }
+
+    // Check if blob already exists in GCS
+    let exists = state.gcs_client
+        .get_object(&google_cloud_storage::http::objects::get::GetObjectRequest {
+            bucket: state.config.gcs_bucket.clone(),
+            object: sha256_hash.clone(),
+            ..Default::default()
+        })
+        .await
+        .is_ok();
+
+    if exists {
+        info!("Blob {} already exists, skipping migration", sha256_hash);
+        return Ok(MigrateResponse {
+            sha256: sha256_hash,
+            size: total_size,
+            content_type,
+            migrated: false,
+            source_url: request.source_url,
+        });
+    }
+
+    // Upload to GCS
+    let upload_type = UploadType::Simple(Media::new(sha256_hash.clone()));
+    let req = UploadObjectRequest {
+        bucket: state.config.gcs_bucket.clone(),
+        ..Default::default()
+    };
+
+    state.gcs_client
+        .upload_object(&req, Bytes::from(all_bytes), &upload_type)
+        .await
+        .map_err(|e| anyhow!("GCS upload failed: {}", e))?;
+
+    // Set content type
+    let update_req = google_cloud_storage::http::objects::patch::PatchObjectRequest {
+        bucket: state.config.gcs_bucket.clone(),
+        object: sha256_hash.clone(),
+        metadata: Some(Object {
+            content_type: Some(content_type.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let _ = state.gcs_client.patch_object(&update_req).await;
+
+    info!("Migrated {} bytes as {} from {}", total_size, sha256_hash, request.source_url);
+
+    Ok(MigrateResponse {
+        sha256: sha256_hash,
+        size: total_size,
+        content_type,
+        migrated: true,
+        source_url: request.source_url,
+    })
+}
+
+/// Create a Blossom auth header from an nsec
+/// nsec is a bech32-encoded Nostr secret key
+fn create_blossom_auth(nsec: &str, action: &str, _url: &str) -> Result<String> {
+    // Decode nsec (bech32)
+    let secret_key_bytes = decode_nsec(nsec)?;
+
+    // Create signing key
+    let signing_key = SigningKey::from_bytes(&secret_key_bytes)
+        .map_err(|e| anyhow!("Invalid secret key: {}", e))?;
+
+    // Get public key
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_bytes = verifying_key.to_bytes();
+    let pubkey_hex = hex::encode(pubkey_bytes);
+
+    // Create event timestamp
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Create expiration (5 minutes from now)
+    let expiration = now + 300;
+
+    // Create tags
+    let tags = vec![
+        vec!["t".to_string(), action.to_string()],
+        vec!["expiration".to_string(), expiration.to_string()],
+    ];
+
+    // Create event (without id and sig)
+    let event_data = serde_json::json!([
+        0,
+        pubkey_hex,
+        now,
+        BLOSSOM_AUTH_KIND,
+        tags,
+        ""
+    ]);
+
+    // Hash to get event ID
+    let event_str = serde_json::to_string(&event_data)?;
+    let mut hasher = Sha256::new();
+    hasher.update(event_str.as_bytes());
+    let event_id = hex::encode(hasher.finalize());
+
+    // Sign the event ID
+    let id_bytes = hex::decode(&event_id)?;
+    let signature = signing_key.sign(&id_bytes);
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    // Create full event
+    let event = serde_json::json!({
+        "id": event_id,
+        "pubkey": pubkey_hex,
+        "created_at": now,
+        "kind": BLOSSOM_AUTH_KIND,
+        "tags": tags,
+        "content": "",
+        "sig": sig_hex
+    });
+
+    // Base64 encode for Authorization header
+    let event_json = serde_json::to_string(&event)?;
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, event_json);
+
+    Ok(format!("Nostr {}", encoded))
+}
+
+/// Decode an nsec (bech32-encoded Nostr secret key) to raw bytes
+fn decode_nsec(nsec: &str) -> Result<[u8; 32]> {
+    if !nsec.starts_with("nsec1") {
+        return Err(anyhow!("Invalid nsec: must start with 'nsec1'"));
+    }
+
+    // Simple bech32 decode (Nostr uses bech32 without checksum verification for keys)
+    let data = &nsec[5..]; // Skip "nsec1" prefix
+
+    // Bech32 alphabet
+    const CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+    let mut bits: Vec<u8> = Vec::new();
+    for c in data.chars() {
+        let val = CHARSET.find(c).ok_or_else(|| anyhow!("Invalid bech32 character: {}", c))? as u8;
+        bits.push(val);
+    }
+
+    // Convert 5-bit groups to 8-bit bytes
+    let mut result = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits_count = 0;
+
+    for val in bits {
+        acc = (acc << 5) | (val as u32);
+        bits_count += 5;
+        while bits_count >= 8 {
+            bits_count -= 8;
+            result.push((acc >> bits_count) as u8);
+            acc &= (1 << bits_count) - 1;
+        }
+    }
+
+    // Take the first 32 bytes (ignore any padding/checksum)
+    if result.len() < 32 {
+        return Err(anyhow!("Invalid nsec: decoded data too short"));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result[..32]);
+    Ok(key)
 }

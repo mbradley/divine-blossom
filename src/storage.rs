@@ -11,6 +11,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Backend name (must match fastly.toml)
 const GCS_BACKEND: &str = "gcs_storage";
 
+/// Cloud Run backend for uploads/migrations
+const CLOUD_RUN_BACKEND: &str = "cloud_run_upload";
+
+/// Fallback backend names and their URL paths (must match fastly.toml)
+/// Each tuple is (backend_name, host, path_prefix)
+/// Path format: {path_prefix}{hash}
+/// Order matters: first match wins, so put fastest/most reliable first
+const FALLBACK_BACKENDS: &[(&str, &str, &str)] = &[
+    ("cdn_divine", "cdn.divine.video", "/"),
+    ("blossom_divine", "blossom.divine.video", "/"),
+    ("cdn_satellite", "cdn.satellite.earth", "/"),
+    // nostr.build uses image subdomain for media
+    ("nostr_build", "image.nostr.build", "/"),
+];
+
 /// Config store name
 const CONFIG_STORE: &str = "blossom_config";
 
@@ -144,6 +159,84 @@ pub fn download_blob(hash: &str, range: Option<&str>) -> Result<Response> {
         status => Err(BlossomError::StorageError(format!(
             "Download failed with status: {}",
             status
+        ))),
+    }
+}
+
+/// Result of a fallback download - includes source information
+pub struct FallbackDownloadResult {
+    pub response: Response,
+    pub source: String, // "gcs" or the backend name that served the content
+}
+
+/// Download a blob with fallback to CDNs
+/// Tries GCS first, then falls back to configured CDN backends
+/// Returns the response and the source that served it
+pub fn download_blob_with_fallback(hash: &str, range: Option<&str>) -> Result<FallbackDownloadResult> {
+    // Try GCS first
+    match download_blob(hash, range) {
+        Ok(resp) => {
+            return Ok(FallbackDownloadResult {
+                response: resp,
+                source: "gcs".to_string(),
+            });
+        }
+        Err(BlossomError::NotFound(_)) => {
+            // Continue to fallback
+        }
+        Err(_e) => {
+            // For non-404 errors, still try fallbacks
+            // This handles cases where GCS is temporarily unavailable
+        }
+    }
+
+    // Try each fallback backend
+    for (backend_name, host, path_prefix) in FALLBACK_BACKENDS {
+        match try_fallback_download(hash, range, backend_name, host, path_prefix) {
+            Ok(resp) => {
+                return Ok(FallbackDownloadResult {
+                    response: resp,
+                    source: backend_name.to_string(),
+                });
+            }
+            Err(_) => {
+                // Continue to next fallback
+                continue;
+            }
+        }
+    }
+
+    // All sources failed
+    Err(BlossomError::NotFound("Blob not found in any storage".into()))
+}
+
+/// Try to download from a fallback CDN (simple HTTP GET, no auth)
+fn try_fallback_download(
+    hash: &str,
+    range: Option<&str>,
+    backend_name: &str,
+    host: &str,
+    path_prefix: &str,
+) -> Result<Response> {
+    let url = format!("https://{}{}{}", host, path_prefix, hash);
+
+    let mut req = Request::new(Method::GET, &url);
+    req.set_header("Host", host);
+
+    if let Some(range_value) = range {
+        req.set_header("Range", range_value);
+    }
+
+    let resp = req
+        .send(backend_name)
+        .map_err(|e| BlossomError::StorageError(format!("Fallback {} failed: {}", backend_name, e)))?;
+
+    match resp.get_status() {
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(resp),
+        StatusCode::NOT_FOUND => Err(BlossomError::NotFound(format!("Not found on {}", backend_name))),
+        status => Err(BlossomError::StorageError(format!(
+            "Fallback {} returned status: {}",
+            backend_name, status
         ))),
     }
 }
@@ -812,4 +905,43 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 fn hash_body_for_signing(_size: u64) -> String {
     // For large uploads, use unsigned payload and let GCS verify
     "UNSIGNED-PAYLOAD".into()
+}
+
+/// Trigger background migration of a blob from a fallback CDN to GCS
+/// This sends an async request to Cloud Run and doesn't wait for completion
+/// Returns Ok if the request was sent successfully (not if migration completed)
+pub fn trigger_background_migration(hash: &str, source_backend: &str) -> Result<()> {
+    // Find the CDN URL for this backend
+    let source_url = match FALLBACK_BACKENDS.iter().find(|(name, _, _)| *name == source_backend) {
+        Some((_, host, path_prefix)) => format!("https://{}{}{}", host, path_prefix, hash),
+        None => return Err(BlossomError::Internal(format!("Unknown fallback backend: {}", source_backend))),
+    };
+
+    // Build migration request JSON
+    let request_body = format!(
+        r#"{{"source_url":"{}","expected_hash":"{}"}}"#,
+        source_url, hash
+    );
+
+    // Send async request to Cloud Run /migrate endpoint
+    // We use send_async so we don't block waiting for the migration to complete
+    let mut req = Request::new(Method::POST, "https://blossom-upload-rust-149672065768.us-central1.run.app/migrate");
+    req.set_header("Host", "blossom-upload-rust-149672065768.us-central1.run.app");
+    req.set_header("Content-Type", "application/json");
+    req.set_header("Content-Length", request_body.len().to_string());
+    req.set_body(request_body);
+
+    // Send async - fire and forget
+    // We use send_async with streaming disabled to fire the request without waiting
+    match req.send_async(CLOUD_RUN_BACKEND) {
+        Ok(_pending) => {
+            // Request sent successfully - we don't wait for response
+            // The PendingRequest will be dropped, but the request is already in flight
+            Ok(())
+        }
+        Err(e) => {
+            // Log error but don't fail the request - migration is best-effort
+            Err(BlossomError::Internal(format!("Failed to trigger migration: {}", e)))
+        }
+    }
 }

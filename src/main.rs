@@ -17,14 +17,14 @@ use crate::metadata::{
     add_to_user_list, check_ownership, delete_blob_metadata, get_blob_metadata,
     list_blobs_with_metadata, put_blob_metadata, remove_from_user_list,
 };
-use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob, upload_blob};
+use crate::storage::{blob_exists, current_timestamp, delete_blob as storage_delete, download_blob_with_fallback, trigger_background_migration, upload_blob};
 
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Error, Request, Response};
 use sha2::{Digest, Sha256};
 
-/// Maximum upload size (200 MB) - supports high-bitrate 6-second 4K video
-const MAX_UPLOAD_SIZE: u64 = 200 * 1024 * 1024;
+/// Maximum upload size (50 GB) - Cloud Run with HTTP/2 has no size limit
+const MAX_UPLOAD_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 
 /// Entry point
 #[fastly::main]
@@ -46,7 +46,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v89-cloud-run-proxy")),
+            .with_body("v110-bud04-mirror")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -54,13 +54,20 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // BUD-02: Upload
         (Method::PUT, "/upload") => handle_upload(req),
-        (Method::HEAD, "/upload") => handle_upload_requirements(),
+        // BUD-06: Upload requirements/pre-validation
+        (Method::HEAD, "/upload") => handle_upload_requirements(req),
 
         // BUD-02: Delete
         (Method::DELETE, p) if is_hash_path(p) => handle_delete(req, p),
 
         // BUD-02: List
         (Method::GET, p) if p.starts_with("/list/") => handle_list(req, p),
+
+        // BUD-09: Report
+        (Method::PUT, "/report") => handle_report(req),
+
+        // BUD-04: Mirror
+        (Method::PUT, "/mirror") => handle_mirror(req),
 
         // CORS preflight
         (Method::OPTIONS, _) => Ok(cors_preflight_response()),
@@ -98,8 +105,9 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Download from B2
-    let mut resp = download_blob(&hash, range.as_deref())?;
+    // Download from GCS with fallback to CDNs
+    let result = download_blob_with_fallback(&hash, range.as_deref())?;
+    let mut resp = result.response;
 
     // Add CORS headers
     add_cors_headers(&mut resp);
@@ -108,6 +116,15 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     if let Some(meta) = metadata {
         resp.set_header("X-Sha256", &meta.sha256);
         resp.set_header("X-Content-Length", meta.size.to_string());
+    }
+
+    // Add header indicating the source (useful for debugging/monitoring)
+    if result.source != "gcs" {
+        resp.set_header("X-Blossom-Source", &result.source);
+
+        // Trigger background migration to GCS via Cloud Run
+        // This is fire-and-forget - we don't wait for completion
+        let _ = trigger_background_migration(&hash, &result.source);
     }
 
     Ok(resp)
@@ -324,8 +341,75 @@ fn handle_cloud_run_proxy(
     Ok(resp)
 }
 
-/// HEAD /upload - Get upload requirements
-fn handle_upload_requirements() -> Result<Response> {
+/// HEAD /upload - BUD-06 upload pre-validation
+/// Clients can send X-SHA-256, X-Content-Length, X-Content-Type headers
+/// to check if an upload would be accepted before sending the full file
+fn handle_upload_requirements(req: Request) -> Result<Response> {
+    // Check for BUD-06 pre-validation headers
+    let sha256 = req
+        .get_header("X-SHA-256")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let content_length: Option<u64> = req
+        .get_header("X-Content-Length")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse().ok());
+    let content_type = req
+        .get_header("X-Content-Type")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // If pre-validation headers provided, validate them
+    if sha256.is_some() || content_length.is_some() || content_type.is_some() {
+        // Validate SHA-256 format (must be 64 hex chars)
+        if let Some(ref hash) = sha256 {
+            if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                let mut resp = Response::from_status(StatusCode::BAD_REQUEST);
+                resp.set_header("X-Reason", "Invalid X-SHA-256 format (must be 64 hex characters)");
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+
+            // Check if blob already exists (optimization - client can skip upload)
+            if blob_exists(hash)? {
+                let mut resp = Response::from_status(StatusCode::OK);
+                resp.set_header("X-Reason", "Blob already exists");
+                resp.set_header("X-Exists", "true");
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+        }
+
+        // Validate content length
+        if let Some(size) = content_length {
+            if size > MAX_UPLOAD_SIZE {
+                let mut resp = Response::from_status(StatusCode::from_u16(413).unwrap());
+                resp.set_header("X-Reason", &format!(
+                    "File too large. Maximum size is {} bytes",
+                    MAX_UPLOAD_SIZE
+                ));
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+            if size == 0 {
+                let mut resp = Response::from_status(StatusCode::BAD_REQUEST);
+                resp.set_header("X-Reason", "File cannot be empty");
+                add_cors_headers(&mut resp);
+                return Ok(resp);
+            }
+        }
+
+        // Content type validation - we accept all types, so this always passes
+        // If we wanted to restrict, we'd check content_type here
+
+        // All validations passed
+        let mut resp = Response::from_status(StatusCode::OK);
+        resp.set_header("X-Reason", "Upload would be accepted");
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    // No pre-validation headers - return general requirements
     let requirements = UploadRequirements {
         max_size: Some(MAX_UPLOAD_SIZE),
         allowed_types: None, // Accept all types
@@ -392,6 +476,215 @@ fn handle_list(req: Request, path: &str) -> Result<Response> {
         .collect();
 
     let mut resp = json_response(StatusCode::OK, &descriptors);
+    add_cors_headers(&mut resp);
+
+    Ok(resp)
+}
+
+/// PUT /report - BUD-09 blob reporting
+/// Accepts a NIP-56 report event in the body to report problematic content
+fn handle_report(mut req: Request) -> Result<Response> {
+    // Parse the report event from body
+    let body = req.take_body().into_string();
+    let report_event: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    // Validate it's a NIP-56 report event (kind 1984)
+    let kind = report_event["kind"].as_u64()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'kind' field".into()))?;
+
+    if kind != 1984 {
+        return Err(BlossomError::BadRequest(format!(
+            "Invalid event kind: expected 1984 (NIP-56 report), got {}",
+            kind
+        )));
+    }
+
+    // Extract x tags (blob sha256 hashes being reported)
+    let tags = report_event["tags"].as_array()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'tags' field".into()))?;
+
+    let mut reported_hashes: Vec<String> = Vec::new();
+    let mut report_type: Option<String> = None;
+
+    for tag in tags {
+        let tag_arr = tag.as_array();
+        if let Some(arr) = tag_arr {
+            if arr.len() >= 2 {
+                let tag_name = arr[0].as_str().unwrap_or("");
+                let tag_value = arr[1].as_str().unwrap_or("");
+
+                if tag_name == "x" && tag_value.len() == 64 {
+                    // Validate it's a valid hex hash
+                    if tag_value.chars().all(|c| c.is_ascii_hexdigit()) {
+                        reported_hashes.push(tag_value.to_string());
+                    }
+                }
+
+                // Capture report type from "report" tag if present
+                if tag_name == "report" {
+                    report_type = Some(tag_value.to_string());
+                }
+            }
+        }
+    }
+
+    if reported_hashes.is_empty() {
+        return Err(BlossomError::BadRequest(
+            "No valid 'x' tags found with blob hashes".into()
+        ));
+    }
+
+    // Get report content (description)
+    let content = report_event["content"].as_str().unwrap_or("");
+
+    // Get reporter pubkey
+    let reporter = report_event["pubkey"].as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'pubkey' field".into()))?;
+
+    // Log the report for operator review
+    // In production, this would be stored in a database or sent to a moderation queue
+    eprintln!(
+        "BUD-09 REPORT: reporter={}, hashes={:?}, type={:?}, content={}",
+        reporter,
+        reported_hashes,
+        report_type,
+        content
+    );
+
+    // Check which blobs actually exist
+    let mut found_blobs = 0;
+    for hash in &reported_hashes {
+        if let Ok(Some(_)) = get_blob_metadata(hash) {
+            found_blobs += 1;
+        }
+    }
+
+    // Return success - report received
+    let response = serde_json::json!({
+        "status": "received",
+        "reported_blobs": reported_hashes.len(),
+        "found_blobs": found_blobs,
+        "message": "Report submitted for review"
+    });
+
+    let mut resp = json_response(StatusCode::OK, &response);
+    add_cors_headers(&mut resp);
+
+    Ok(resp)
+}
+
+/// PUT /mirror - BUD-04 blob mirroring
+/// Downloads a blob from a remote URL and stores it locally
+/// Proxies to Cloud Run which handles the actual fetch, hash, and upload
+fn handle_mirror(mut req: Request) -> Result<Response> {
+    // Validate auth (upload permission required)
+    let auth = validate_auth(&req, AuthAction::Upload)?;
+
+    // Parse request body as JSON
+    let body = req.take_body().into_string();
+    if body.is_empty() {
+        return Err(BlossomError::BadRequest("Request body required".into()));
+    }
+
+    let mirror_req: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| BlossomError::BadRequest(format!("Invalid JSON: {}", e)))?;
+
+    // Extract and validate URL
+    let url = mirror_req["url"]
+        .as_str()
+        .ok_or_else(|| BlossomError::BadRequest("Missing 'url' field".into()))?;
+
+    // Basic URL validation
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(BlossomError::BadRequest("Invalid URL: must start with http:// or https://".into()));
+    }
+
+    // Get expected hash from auth event's x tag (optional per BUD-04)
+    let expected_hash = auth.get_hash();
+
+    let base_url = get_base_url(&req);
+
+    // Proxy to Cloud Run /migrate endpoint which handles the actual work
+    // This avoids WASM memory limits for large blobs
+    let migrate_body = if let Some(hash) = &expected_hash {
+        serde_json::json!({
+            "source_url": url,
+            "expected_hash": hash
+        })
+    } else {
+        serde_json::json!({
+            "source_url": url
+        })
+    };
+
+    let migrate_json = serde_json::to_string(&migrate_body)
+        .map_err(|e| BlossomError::Internal(format!("JSON error: {}", e)))?;
+
+    let mut proxy_req = Request::new(
+        fastly::http::Method::POST,
+        "https://blossom-upload-rust-149672065768.us-central1.run.app/migrate",
+    );
+    proxy_req.set_header("Host", "blossom-upload-rust-149672065768.us-central1.run.app");
+    proxy_req.set_header("Content-Type", "application/json");
+    proxy_req.set_header("Content-Length", migrate_json.len().to_string());
+    proxy_req.set_body(migrate_json);
+
+    let mut proxy_resp = proxy_req
+        .send(CLOUD_RUN_BACKEND)
+        .map_err(|e| BlossomError::Internal(format!("Failed to proxy to Cloud Run: {}", e)))?;
+
+    if !proxy_resp.get_status().is_success() {
+        let status = proxy_resp.get_status();
+        let body = proxy_resp.take_body().into_string();
+        return Err(BlossomError::Internal(format!(
+            "Mirror failed ({}): {}",
+            status, body
+        )));
+    }
+
+    // Parse Cloud Run response
+    let resp_body = proxy_resp.take_body().into_string();
+    let cloud_run_resp: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| BlossomError::Internal(format!("Invalid Cloud Run response: {}", e)))?;
+
+    let hash = cloud_run_resp["sha256"]
+        .as_str()
+        .ok_or_else(|| BlossomError::Internal("Missing sha256 in response".into()))?
+        .to_string();
+
+    let size = cloud_run_resp["size"].as_u64().unwrap_or(0);
+    let content_type = cloud_run_resp["type"]
+        .as_str()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    // Check if metadata already exists
+    if let Some(metadata) = get_blob_metadata(&hash)? {
+        let descriptor = metadata.to_descriptor(&base_url);
+        let mut resp = json_response(StatusCode::OK, &descriptor);
+        add_cors_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    // Store metadata
+    let metadata = BlobMetadata {
+        sha256: hash.clone(),
+        size,
+        mime_type: content_type,
+        uploaded: current_timestamp(),
+        owner: auth.pubkey.clone(),
+        status: BlobStatus::Pending,
+        thumbnail: None,
+        moderation: None,
+    };
+
+    put_blob_metadata(&metadata)?;
+    add_to_user_list(&auth.pubkey, &hash)?;
+
+    // Return blob descriptor per BUD-04
+    let descriptor = metadata.to_descriptor(&base_url);
+    let mut resp = json_response(StatusCode::OK, &descriptor);
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -541,43 +834,57 @@ fn handle_landing_page() -> Response {
             <div class="endpoint">
                 <span class="method method-get">GET</span>
                 <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension.</p>
+                    <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
+                    <p class="endpoint-desc">Retrieve a blob by its SHA-256 hash. Supports optional file extension and range requests. <em>(BUD-01)</em></p>
                 </div>
             </div>
             <div class="endpoint">
                 <span class="method method-head">HEAD</span>
                 <div class="endpoint-info">
-                    <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Check if a blob exists and get its metadata.</p>
+                    <span class="endpoint-path">/&lt;sha256&gt;[.ext]</span>
+                    <p class="endpoint-desc">Check if a blob exists and get its metadata. <em>(BUD-01)</em></p>
                 </div>
             </div>
             <div class="endpoint">
                 <span class="method method-put">PUT</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication.</p>
+                    <p class="endpoint-desc">Upload a new blob. Requires Nostr authentication (kind 24242 event). <em>(BUD-02)</em></p>
                 </div>
             </div>
             <div class="endpoint">
                 <span class="method method-head">HEAD</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/upload</span>
-                    <p class="endpoint-desc">Get upload requirements (max size, allowed types).</p>
+                    <p class="endpoint-desc">Pre-validate upload with X-SHA-256, X-Content-Length, X-Content-Type headers. <em>(BUD-06)</em></p>
                 </div>
             </div>
             <div class="endpoint">
                 <span class="method method-get">GET</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/list/&lt;pubkey&gt;</span>
-                    <p class="endpoint-desc">List all blobs uploaded by a public key.</p>
+                    <p class="endpoint-desc">List all blobs uploaded by a public key. <em>(BUD-02)</em></p>
                 </div>
             </div>
             <div class="endpoint">
                 <span class="method method-delete">DELETE</span>
                 <div class="endpoint-info">
                     <span class="endpoint-path">/&lt;sha256&gt;</span>
-                    <p class="endpoint-desc">Delete a blob. Requires Nostr authentication and ownership.</p>
+                    <p class="endpoint-desc">Delete a blob. Requires Nostr authentication and ownership. <em>(BUD-02)</em></p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-put">PUT</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/report</span>
+                    <p class="endpoint-desc">Report problematic content using NIP-56 events (kind 1984). <em>(BUD-09)</em></p>
+                </div>
+            </div>
+            <div class="endpoint">
+                <span class="method method-put">PUT</span>
+                <div class="endpoint-info">
+                    <span class="endpoint-path">/mirror</span>
+                    <p class="endpoint-desc">Mirror a blob from a remote URL. Requires Nostr authentication. <em>(BUD-04)</em></p>
                 </div>
             </div>
         </section>
@@ -606,8 +913,9 @@ fn handle_landing_page() -> Response {
 
         <section>
             <h2>Protocol</h2>
-            <p>This server implements the <a href="https://github.com/hzrd149/blossom">Blossom protocol</a> (BUD-01 and BUD-02) for decentralized media hosting on Nostr.</p>
-            <p style="margin-top: 0.5rem;">Maximum upload size: <code>200 MB</code></p>
+            <p>This server implements the <a href="https://github.com/hzrd149/blossom">Blossom protocol</a> for decentralized media hosting on Nostr.</p>
+            <p style="margin-top: 0.5rem;"><strong>Implemented BUDs:</strong> BUD-01 (Blob Retrieval), BUD-02 (Upload/List/Delete), BUD-04 (Mirroring), BUD-06 (Upload Pre-validation), BUD-09 (Reporting)</p>
+            <p style="margin-top: 0.5rem;">Maximum upload size: <code>50 GB</code></p>
         </section>
 
         <footer>
