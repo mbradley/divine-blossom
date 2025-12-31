@@ -28,3 +28,6 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - WASM out-of-memory errors when uploading files >5MB
 - Production GCS bucket IAM permissions for public read access and Cloud Run uploads
+- Cloud Run upload proxy returning 404 errors due to incorrect Host header
+  - Fastly was sending `Host: media-backend.divine.video` but Cloud Run domain mapping wasn't configured
+  - Fixed by using actual Cloud Run hostname `blossom-upload-rust-*.us-central1.run.app` in Host header
