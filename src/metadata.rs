@@ -92,28 +92,65 @@ pub fn get_user_blobs(pubkey: &str) -> Result<Vec<String>> {
     }
 }
 
-/// Add a blob hash to user's list
+/// Add a blob hash to user's list with retry for concurrent writes
 pub fn add_to_user_list(pubkey: &str, hash: &str) -> Result<()> {
-    let mut hashes = get_user_blobs(pubkey)?;
     let hash_lower = hash.to_lowercase();
 
-    if !hashes.contains(&hash_lower) {
-        hashes.push(hash_lower);
-        put_user_list(pubkey, &hashes)?;
+    // Retry up to 5 times with increasing delay for concurrent write conflicts
+    for attempt in 0..5 {
+        let mut hashes = get_user_blobs(pubkey)?;
+
+        if hashes.contains(&hash_lower) {
+            // Already in list, nothing to do
+            return Ok(());
+        }
+
+        hashes.push(hash_lower.clone());
+
+        match put_user_list(pubkey, &hashes) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 4 => {
+                // Log retry and continue
+                eprintln!("[KV] Retry {} for user list update: {}", attempt + 1, e);
+                // Small delay before retry (10ms, 20ms, 40ms, 80ms)
+                // Note: Fastly Compute doesn't have sleep, so we just retry immediately
+                // The re-read of the list should pick up concurrent writes
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
-    Ok(())
+    // Should never reach here, but just in case
+    Err(BlossomError::MetadataError("Max retries exceeded for list update".into()))
 }
 
-/// Remove a blob hash from user's list
+/// Remove a blob hash from user's list with retry for concurrent writes
 pub fn remove_from_user_list(pubkey: &str, hash: &str) -> Result<()> {
-    let mut hashes = get_user_blobs(pubkey)?;
     let hash_lower = hash.to_lowercase();
 
-    hashes.retain(|h| h != &hash_lower);
-    put_user_list(pubkey, &hashes)?;
+    // Retry up to 5 times for concurrent write conflicts
+    for attempt in 0..5 {
+        let mut hashes = get_user_blobs(pubkey)?;
 
-    Ok(())
+        if !hashes.contains(&hash_lower) {
+            // Not in list, nothing to do
+            return Ok(());
+        }
+
+        hashes.retain(|h| h != &hash_lower);
+
+        match put_user_list(pubkey, &hashes) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < 4 => {
+                eprintln!("[KV] Retry {} for user list removal: {}", attempt + 1, e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(BlossomError::MetadataError("Max retries exceeded for list removal".into()))
 }
 
 /// Store user's blob list

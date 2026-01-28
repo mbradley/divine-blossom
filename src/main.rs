@@ -49,7 +49,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v117-thumbnails")),
+            .with_body("v118-kv-retry")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
