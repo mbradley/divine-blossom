@@ -49,7 +49,7 @@ fn handle_request(req: Request) -> Result<Response> {
 
         // Version check
         (Method::GET, "/version") => Ok(Response::from_status(StatusCode::OK)
-            .with_body("v118-kv-retry")),
+            .with_body("v120-headers-fix")),
 
         // BUD-01: Blob retrieval
         (Method::GET, p) if is_hash_path(p) => handle_get_blob(req, p),
@@ -91,6 +91,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
         match download_thumbnail(&thumbnail_key) {
             Ok(mut resp) => {
                 resp.set_header("Content-Type", "image/jpeg");
+                resp.set_header("Accept-Ranges", "bytes");
                 add_cors_headers(&mut resp);
                 return Ok(resp);
             }
@@ -100,6 +101,7 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
                 match generate_thumbnail_on_demand(hash) {
                     Ok(mut resp) => {
                         resp.set_header("Content-Type", "image/jpeg");
+                        resp.set_header("Accept-Ranges", "bytes");
                         add_cors_headers(&mut resp);
                         return Ok(resp);
                     }
@@ -148,12 +150,29 @@ fn handle_get_blob(req: Request, path: &str) -> Result<Response> {
     // Add CORS headers
     add_cors_headers(&mut resp);
 
+    // Always indicate range request support for video streaming
+    resp.set_header("Accept-Ranges", "bytes");
+
     // Add Blossom headers and ensure correct Content-Type from metadata
+    // IMPORTANT: Don't overwrite Content-Length for 206 Partial Content responses
+    // as the backend sets it to the partial content size
+    let is_partial = resp.get_status() == StatusCode::PARTIAL_CONTENT;
+
     if let Some(ref meta) = metadata {
         // Set Content-Type from stored metadata (more reliable than origin server)
         resp.set_header("Content-Type", &meta.mime_type);
         resp.set_header("X-Sha256", &meta.sha256);
         resp.set_header("X-Content-Length", meta.size.to_string());
+
+        // Only set Content-Length for full responses (200), not partial (206)
+        if !is_partial {
+            resp.set_header("Content-Length", meta.size.to_string());
+        }
+    } else {
+        // No metadata - try to infer MIME type from file extension in path
+        if let Some(mime_type) = infer_mime_from_path(path) {
+            resp.set_header("Content-Type", mime_type);
+        }
     }
 
     // Add header indicating the source (useful for debugging/monitoring)
@@ -180,6 +199,7 @@ fn handle_head_blob(path: &str) -> Result<Response> {
         let mut head_resp = Response::from_status(StatusCode::OK);
         head_resp.set_header("Content-Type", "image/jpeg");
         head_resp.set_header("Content-Length", &content_length);
+        head_resp.set_header("Accept-Ranges", "bytes");
         add_cors_headers(&mut head_resp);
         return Ok(head_resp);
     }
@@ -197,9 +217,13 @@ fn handle_head_blob(path: &str) -> Result<Response> {
     }
 
     let mut resp = Response::from_status(StatusCode::OK);
-    resp.set_header("Content-Type", &metadata.mime_type);
-    resp.set_header("Content-Length", metadata.size.to_string());
+    resp.set_header(header::CONTENT_TYPE, &metadata.mime_type);
+    // Note: For HEAD responses, Fastly/HTTP/2 may strip Content-Length when there's no body
+    // X-Content-Length provides the size info as a workaround
+    resp.set_header(header::CONTENT_LENGTH, metadata.size.to_string());
     resp.set_header("X-Sha256", &metadata.sha256);
+    resp.set_header("X-Content-Length", metadata.size.to_string());
+    resp.set_header("Accept-Ranges", "bytes");
     add_cors_headers(&mut resp);
 
     Ok(resp)
@@ -1174,4 +1198,68 @@ fn get_base_url(req: &Request) -> String {
         .and_then(|h| h.to_str().ok())
         .map(|host| format!("https://{}", host))
         .unwrap_or_else(|| "https://media.divine.video".into())
+}
+
+/// Infer MIME type from file extension in path
+fn infer_mime_from_path(path: &str) -> Option<&'static str> {
+    let path_lower = path.to_lowercase();
+
+    // Video types
+    if path_lower.ends_with(".mp4") || path_lower.ends_with(".m4v") {
+        return Some("video/mp4");
+    }
+    if path_lower.ends_with(".webm") {
+        return Some("video/webm");
+    }
+    if path_lower.ends_with(".mov") {
+        return Some("video/quicktime");
+    }
+    if path_lower.ends_with(".avi") {
+        return Some("video/x-msvideo");
+    }
+    if path_lower.ends_with(".mkv") {
+        return Some("video/x-matroska");
+    }
+    if path_lower.ends_with(".ogv") {
+        return Some("video/ogg");
+    }
+
+    // Image types
+    if path_lower.ends_with(".jpg") || path_lower.ends_with(".jpeg") {
+        return Some("image/jpeg");
+    }
+    if path_lower.ends_with(".png") {
+        return Some("image/png");
+    }
+    if path_lower.ends_with(".gif") {
+        return Some("image/gif");
+    }
+    if path_lower.ends_with(".webp") {
+        return Some("image/webp");
+    }
+    if path_lower.ends_with(".svg") {
+        return Some("image/svg+xml");
+    }
+    if path_lower.ends_with(".avif") {
+        return Some("image/avif");
+    }
+
+    // Audio types
+    if path_lower.ends_with(".mp3") {
+        return Some("audio/mpeg");
+    }
+    if path_lower.ends_with(".wav") {
+        return Some("audio/wav");
+    }
+    if path_lower.ends_with(".ogg") || path_lower.ends_with(".oga") {
+        return Some("audio/ogg");
+    }
+    if path_lower.ends_with(".flac") {
+        return Some("audio/flac");
+    }
+    if path_lower.ends_with(".m4a") {
+        return Some("audio/mp4");
+    }
+
+    None
 }

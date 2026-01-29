@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- MIME type inference from file extension when metadata is missing
+  - Supports video (mp4, webm, mov, avi, mkv, ogv), image (jpg, png, gif, webp, svg, avif), and audio (mp3, wav, ogg, flac, m4a) formats
+
+### Fixed
+- Added `Content-Length` header to GET responses (was missing)
+- Added `Accept-Ranges: bytes` header to all blob responses for proper video streaming support
+- Added `X-Content-Length` header as workaround for HTTP/2 stripping Content-Length on HEAD responses
+- Fixed range requests (206 Partial Content) - no longer overwrites Content-Length with full file size
+- Improved header consistency between GET and HEAD responses
+
+### Added (previous)
 - Cloud Run upload service for handling large file uploads (>500KB)
   - Rust-based service with Nostr auth validation
   - Streaming upload to GCS with SHA-256 hashing
